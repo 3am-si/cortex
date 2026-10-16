@@ -917,6 +917,8 @@ buckets.
 
 ## Housekeeping after approval
 
+- This plan is published as `PLAN.md` in https://github.com/3am-si/cortex. Keep it in sync on each revision.
+
 - Add `platform-revamp.md` to `MEMORY.md`.
 - Update `3am-web-design-system.md`: the console now follows the AWS/GCP console pattern (functionality over design),
   superseding the 2026-10-06 "light enterprise" note.
