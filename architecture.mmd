@@ -1,0 +1,122 @@
+%%{init: {"flowchart": {"nodeSpacing": 40, "rankSpacing": 60, "curve": "basis"}}}%%
+flowchart TB
+    Approvers((Two approvers))
+
+    subgraph Interfaces [Interfaces & Entry Points]
+        direction LR
+        Console[console: TypeScript]
+        CLI[3am-cli: composable stdin/stdout]
+        Chat[Slack / Teams]
+        TF[Terraform provider]
+    end
+
+    subgraph Sources [Change & Telemetry Sources]
+        direction LR
+        CloudAPIs[GCP & AWS APIs]
+        Changes[GitHub, rollout & flags, audit logs, Debezium CDC]
+    end
+
+    subgraph Control_Plane [Control Plane - in the customer's primary cloud]
+        Control[control: Go - API, planner, topology graph]
+
+        subgraph Sync_Zone [Narrow Linearizable Write Path]
+            Keel[keel: Rust - safety kernel]
+            Etcd[(etcd: quorum, leases, fences)]
+            Ledger[(Transparency log - KMS seal + customer witness)]
+        end
+
+        subgraph Async_Zone [Broad Asynchronous Read & Planning Surface]
+            Bus((NATS JetStream: streams & work queues))
+            Infer[infer: Python - stats & causal, no LLM]
+            Reasoner[reasoner: Python - LLM proposals only]
+            Cloud[cloud: Go - read adapters & change ingest]
+            Auditor[auditor: Go - independent verifier]
+            Proj[(Postgres projections - derived)]
+        end
+    end
+
+    subgraph Book_Path [Book Changes - AI proposes, human executes]
+        CAB[ServiceNow change / DBA tooling]
+        DBA((Human DBA))
+    end
+
+    Followups[Jira, GitHub PRs, PagerDuty]
+
+    subgraph Fleet [Fanned-Out Fleet - GCP, AWS, On-Prem]
+        subgraph Site_1 [Site 1]
+            Relay1[relay: NATS leaf, outbound 443]
+            Runner1[runner: Rust agent]
+            subgraph Shards_1 [Customer shards - primary + replica]
+                Ops1[(Operational tables)]
+                Books1[(Book tables - read-only to 3AM)]
+            end
+            Clone1[(Clones - rehearsal & experiments)]
+        end
+        subgraph Site_N [Site N]
+            RelayN[relay: NATS leaf, outbound 443]
+            RunnerN[runner: Rust agent]
+            ShardsN[(Customer shards)]
+        end
+    end
+
+    Evidence[(Evidence store - Object Lock, customer KMS)]
+
+    subgraph Legacy_Strangler [Strangler Fig Transition]
+        Legacy[3am-classic]
+        Pinata[pinata: output diffing]
+    end
+
+    %% people and entry points
+    Approvers -- "WebAuthn step-up" --> Interfaces
+    Interfaces --> Control
+
+    %% synchronous authority path: commands never travel over the bus
+    Control == "Commands: approve, halt, start wave - CAS on plan_hash" ==> Keel
+    Keel <--> Etcd
+    Keel -- "Append immutable event" --> Ledger
+    Keel -- "Outbox: intents, leases, events" --> Bus
+
+    %% asynchronous read and planning surface
+    CloudAPIs --> Cloud
+    Changes --> Cloud
+    Cloud --> Bus
+    Bus <--> Infer
+    Bus <--> Reasoner
+    Bus <--> Auditor
+    Ledger -- "Re-verify, cross-check" --> Auditor
+    Bus --> Proj
+    Control -- "Reads views 'as of revision N'" --> Proj
+    Control -- "After-commit follow-through" --> Followups
+
+    %% fleet
+    Bus <-->|"Outbound-only 443"| Relay1
+    Bus <-->|"Outbound-only 443"| RelayN
+    Relay1 --- Runner1
+    RelayN --- RunnerN
+    Runner1 -- "Read probes: summaries + observed position" --> Ops1
+    Runner1 -- "Read probes & post-DBA verification" --> Books1
+    Runner1 == "JIT credential, fence, premise re-check, marker, commit" ==> Ops1
+    Runner1 -- "Clone: do(cause) / placebo" --> Clone1
+    Runner1 -- "Pre-signed upload: evidence, encrypted before-images" --> Evidence
+    RunnerN --> ShardsN
+
+    %% books: AI proposes, human executes, AI verifies
+    Control -- "Signed change package" --> CAB
+    CAB --> DBA
+    DBA -- "Own identity & key: 3am-run or plain SQL" --> Books1
+
+    %% strangler
+    Legacy -- "Ledger events" --> Bus
+    Control -. "Replay comparison" .-> Pinata
+
+    classDef async fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,stroke-dasharray: 5 5;
+    classDef sync fill:#ffebee,stroke:#c62828,stroke-width:2px;
+    classDef human fill:#fff3e0,stroke:#e65100,stroke-width:2px;
+    classDef books fill:#fff8e1,stroke:#b8860b,stroke-width:2px;
+    classDef ext fill:#f5f5f5,stroke:#757575;
+
+    class Async_Zone async;
+    class Sync_Zone,Keel,Etcd,Ledger sync;
+    class Approvers,DBA human;
+    class Books1 books;
+    class CloudAPIs,Changes,Followups,CAB ext;
