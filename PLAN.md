@@ -24,7 +24,11 @@
 - *A First Course in Causal Inference* (Ding): design-based proof, i.e. randomization tests, negative controls,
   sensitivity analysis, overlap, natural experiments.
 
-Every decision below traces to a chapter; the index is at the end. "Ironclad" here means three things:
+A second review checked the plan against 24 primary papers: logs and transparency, consensus and leases, clocks,
+testing, knockoffs and invariance, CDC, messaging, protection and LLM-agent security. Each change it caused cites
+the paper, and the paper index is at the end after the book index.
+
+Every decision below traces to a chapter or a paper; the indexes are at the end. "Ironclad" here means three things:
 - every safety property has a mechanism and a test;
 - every causal claim has a stated estimand, identifying assumptions and a falsification check;
 - every remaining risk is named, in the failure-mode and residual-risk tables near the end.
@@ -104,13 +108,13 @@ records. For those, sqlguard refuses every write and no write credential is ever
   enforces sqlguard, waves, before-images, the fence, the premise re-check, the `_threeam.applied` marker and the
   journal, so 38 shards is one command with every safety rule.
 
-**Book fixes default to compensating entries** (DDIA ch. 11). That means a reversal row plus a correcting row, with a
-reason code and the incident reference. They are never an in-place `UPDATE` when the schema is ledger-style; that is
-how the bank's own accountants would do it.
+**Book fixes default to compensating entries** (DDIA ch. 11; Helland 2015, "accountants don't use erasers"). That
+means a reversal row plus a correcting row, with a reason code and the incident reference. They are never an
+in-place `UPDATE` when the schema is ledger-style; that is how the bank's own accountants would do it.
 
 **Either way**, 3AM verifies all 38 shards afterwards, and the ledger records who executed what, with which key.
 
-## The invariants (compiled into keel, runner and sqlguard; each has a TLA+ property or a test)
+## The invariants (compiled into keel, runner, sqlguard and vet; each has a TLA+ property or a test)
 
 **Safety, which must hold under any fault** (DDIA ch. 8 system model: partially synchronous, crash-recovery):
 
@@ -126,24 +130,44 @@ how the bank's own accountants would do it.
    checksum must equal the approved values. Any difference aborts the transaction and halts the plan. This is
    application-level SSI.
 6. **FenceInDatabase.** The fix transaction runs `UPDATE _threeam.fence SET token=$t WHERE shard=$s AND token<$t`.
-   Zero rows aborts. The token is keel's etcd revision, so a paused runner with a stale lease cannot commit.
+   Zero rows aborts. The token is keel's etcd revision, so a paused runner with a stale lease cannot commit. This
+   is Chubby's sequencer, checked by the resource itself (Burrows 2006).
+   - **Targets that can't check a fence** (cloud action cards, on-prem tools, anything outside SQL) get a
+     **lock-delay** instead. After a lease is lost uncleanly, no runner may act on that target until the old
+     lease's maximum lifetime plus clock uncertainty has passed.
 7. **AtMostOnceApply.** The `_threeam.applied(op_id, step_id, plan_hash, fence, before_image_sha)` row commits in the
    same transaction as the fix. Reconciliation reads the marker; it never re-runs blindly.
 8. **NoCrossShardAtomicity.** No 2PC or XA, ever. Each shard commits on its own. The plan guarantees that every shard
    ends verified-fixed, verified-untouched, or halted with known state.
-9. **TimeoutIsUnknown.** Every RPC timeout is "outcome unknown". Only the marker resolves it.
+9. **TimeoutIsUnknown.** Every RPC timeout is "outcome unknown". Only the marker resolves it. A timeout cannot tell
+   "committed, ack lost" from "slow" from "dead" (Fischer, Lynch & Paterson 1985). So no safety property may
+   depend on a timeout firing in time; timeouts serve liveness only.
 10. **UnknownIsNotClean.** An unreachable or late shard is Unknown. It is never imputed, and proof must hold under
     every completion of the Unknowns (ESL ch. 9.6: unreachability is not missing-at-random).
 11. **HaltOnFailover.** A DB failover or timeline change on any shard halts the plan. Committed shards are then
     re-verified, because a marker that is gone means the fix is gone.
 12. **NoDualWrites.** keel appends; everything else follows from its log through an outbox. Derived state (Postgres
-    projections, cubes, the global index, the topology graph) is never consulted for a safety decision.
+    projections, cubes, the global index, the topology graph) is never consulted for a safety decision. Every
+    authority read (approved? lease live? halt set?) is an etcd **linearizable** read, never `serializable`
+    (Ongaro & Ousterhout 2014).
 13. **DeterministicScripts.** sqlguard refuses `now()`, `random()`, `nextval` and `LIMIT` without a total
     `ORDER BY`. Every trigger, rule, cascade and CDC subscriber on a target table must be declared.
 14. **NamedHuman.** Every write has a named, accountable human approver in the ledger. A model is never the
-    accountable party.
+    accountable party. Shared approver accounts are refused: the principal is the unit of accountability
+    (Saltzer & Schroeder 1975).
+15. **NoStaleReports.** Every report carries the keel epoch, lease and fence it was produced under. Examples are a
+    probe result, a runner ack and a site's late events. A report from a superseded epoch is quarantined and never
+    merged into state. This is the Azure vNext bug class, where a node already declared dead re-added replicas
+    (Deligiannis et al. 2016).
+16. **ReasonerHasNoAuthority.** No LLM output is ever authority. The reasoner cannot grant a rung, approve, choose an
+    assignment, hold a credential or reach the network. Everything it proposes passes deterministic gates and two
+    humans. See "The LLM boundary".
+17. **IndependentPreApplyCheck.** No shard write gets a credential unless `vet`, a second, diverse implementation,
+    agrees with the runner. `vet` independently checks the plan, approvals, fence, scope and expected after-image
+    (Avizienis 1985; Saltzer & Schroeder's single-fault invulnerability).
 
-**Liveness:** a plan eventually finishes or halts, and an approval eventually expires.
+**Liveness:** a plan eventually finishes or halts, and an approval eventually expires. Both are stated under partial
+synchrony and explicit fairness, because FLP rules out termination in a fully asynchronous model.
 
 **Verification is of the cause, not the symptom** (ECI). A plan that only treats a symptom is labelled "mitigation,
 not repair" and can never close an incident.
@@ -170,16 +194,17 @@ The control plane never touches a database. Every cloud VPC or account and every
 
 | Service | Lang | Role |
 |---|---|---|
-| `keel` | Rust | Safety kernel. Event-sourced: commands are validated by compare-and-set on **etcd** (3 voters, 5 for banks, one region, 3 zones) and appended as immutable events. One active leader through an etcd lease. Holds plans, approvals, intents/outcomes, leases, fences (= etcd revision), halt, budgets, autonomy, the JIT credential broker and Cedar authorization. **We don't write our own Raft** (DDIA ch. 9). FoundationDB is the alternative, decided by the M1 step-2 spike. |
-| `runner` | Rust | Site agent: outbound-only. Guarded read probes, routed to replicas with the **observed position** recorded. Journaled write steps with fence, premise re-check and marker. Encrypted before-images, uploaded by **pre-signed single-object URL**. Signs evidence with a per-site key. **Subscribes** to policy, pack, routing and fence-config streams and keeps local versioned copies. |
-| `sqlguard` | Rust (lib, CLI, WASM) | Fail-closed AST rules, identical at approval, at execution, in `3am-run` and in the console. |
+| `keel` | Rust | Safety kernel. Event-sourced: commands are validated by compare-and-set on **etcd** (3 voters, 5 for banks, one region, 3 zones) and appended as immutable events. One active leader through an etcd lease. Holds plans, approvals, intents/outcomes, leases, fences (= etcd revision), halt, budgets, autonomy, the JIT credential broker and Cedar authorization. **We don't write our own Raft** (DDIA ch. 9). Every command carries its op ID inside the same etcd transaction, so a client retry can't apply it twice. Every write is a CAS on the leader key's revision, so an ex-leader's write fails in etcd itself. Every response carries the leader epoch (Raft §8; Chubby). FoundationDB is the alternative, decided by the M1 step-2 spike. |
+| `runner` | Rust | Site agent: outbound-only. Guarded read probes, routed to replicas with the **observed position** recorded. Journaled write steps with fence, premise re-check and marker. Encrypted before-images, uploaded by **pre-signed single-object URL**. Signs evidence with a per-site key. **Subscribes** to policy, pack, routing and fence-config streams and keeps local versioned copies. Has a **jeopardy** state: when its conservative local lease runs out, it starts no new write step and finishes or aborts the step in flight before the real lease expires (Chubby). Rejects messages from an older keel epoch. Plaintext customer data never touches its disk: keys sit in locked memory, swap is off, and scratch is encrypted. |
+| `sqlguard` | Rust (lib, CLI, WASM) | Fail-closed AST rules, identical at approval, at execution, in `3am-run` and in the console. A parse failure or an unknown statement type is a refusal. |
+| `vet` | Go | **The diverse pre-apply checker** (invariant 17). It runs at each site as its own process, with a different owner from keel and runner. Before the broker issues a shard credential, `vet` checks the following itself: the two approvals, via its own linearizable etcd read; the fence; scope ⊆ approved keys; statement hashes; the expected after-image hash against the ledgered rehearsal. Then it signs a per-step token. Right after `COMMIT` it reads the marker and after-image checksum back from the shard, and it halts the next wave on any mismatch. It reads raw sources only, never keel's projections or APIs. |
 | `control` | Go | API (ConnectRPC, Google AIPs), inventory and topology graph (in memory, one process), intake, scope, planner, notify, follow-through. Stateless replicas. |
 | `cloud` | Go | GCP and AWS read adapters generated from Discovery and Smithy; curated write action cards; change-stream ingesters. |
-| `infer` | Python | **Deterministic statistics and causal engine, with no LLM and no network.** Computes the detection residuals, the stratified differential, permutation FDR, decoys, ICP and the stability bootstrap. It produces proof-ladder rungs 1–3 only. Fixed seeds, pinned versions, replayable. |
-| `reasoner` | Python | LLM proposals: hypotheses, SQL and code-fix drafts. Read-only tools and verbatim values. Temperature 0, with prompts and seeds recorded. **Proposes; never grants a rung.** |
-| `auditor` | Go | An independent read-only consumer, deliberately *not* in keel's language, for N-version diversity (DDIA ch. 8/12). It re-verifies past fixes on a schedule, cross-checks ledger ↔ markers ↔ keel outcomes, rebuilds projections and diffs them, and runs quarterly restore drills. |
+| `infer` | Python | **Deterministic statistics and causal engine, with no LLM and no network.** Computes the detection residuals, the stratified differential, permutation null, model-X knockoff+ selection, ICP, stability selection and conformal calibration. It produces proof-ladder rungs 1–3 only. Fixed seeds, pinned versions, replayable. |
+| `reasoner` | Python | LLM proposals: hypotheses, SQL and code-fix drafts. Templated read-only tools and verbatim values. No network egress except the model endpoint, and no memory across incidents. Temperature 0, with prompts and seeds recorded, and its *output* ledgered, because temperature 0 is not replayable. **Proposes; never grants a rung** (invariant 16). |
+| `auditor` | Go | An independent read-only consumer, deliberately *not* in keel's language (DDIA ch. 8/12). **It detects after the fact; it doesn't tolerate faults at execution time. `vet` does that** (Avizienis 1985). It re-verifies past fixes on a schedule. It cross-checks ledger ↔ markers ↔ keel outcomes from raw sources, using its own Merkle verifier. It rebuilds projections and diffs them, reconciles the relay count audits, and runs quarterly restore drills. When it stalls, it reports "audit missing", never "audit clean". |
 | `console` | TypeScript | AWS/GCP-console style. Every view is stamped "as of keel revision N". |
-| CDC | packaged Debezium Server | Logical decoding (pgoutput, binlog row format, SQL Server CDC). Java runs where it is strongest, as packaged Debezium and as a JDBC driver sidecar for Oracle/DB2 in M2. We don't maintain a first-party Java service. |
+| CDC | packaged Debezium Server | Logical decoding (pgoutput, binlog row format, SQL Server CDC), under the CDC contract below. Java runs where it is strongest, as packaged Debezium and as a JDBC driver sidecar for Oracle/DB2 in M2. We don't maintain a first-party Java service. |
 
 **Required core for an install** (DDIA ch. 12, the fewest moving parts):
 - **Kubernetes, etcd, Postgres 16, an S3-compatible store with Object Lock, NATS JetStream.**
@@ -202,11 +227,42 @@ The control plane never touches a database. Every cloud VPC or account and every
 - Leaf nodes over outbound 443 are the relay transport.
 - Retained streams make **backtesting** possible: replay last quarter through a new pack or model and score it
   offline before it runs live.
+- **Bus contract** (Kreps et al. 2011):
+  - Delivery is at-least-once, so every consumer is idempotent, keyed by event ID or op ID.
+  - Order holds only within a partition (a shard). Cross-shard reasoning orders by keel revision or log position
+    carried in the event, never by arrival.
+  - Each stream has explicit retention, sized for "replay last quarter". An alarm fires before any consumer's lag
+    reaches the retention edge, because lag past retention is silent loss.
+  - Publishes are R3 and acked. keel's outbox waits for the ack.
+  - Each runner publishes per-window event counts per stream; `auditor` reconciles them with what arrived. That
+    proves end-to-end that nothing was lost across the relay.
+  - Every message carries its schema descriptor hash. A consumer refuses a schema it doesn't know.
 
-**Ledger:**
+**Ledger** (Crosby & Wallach 2009; RFC 6962; Chuat et al. 2015):
 - A **transparency log**: a Merkle tree over records, with inclusion and consistency proofs.
+  - It uses **RFC 6962's construction exactly**: SHA-256, leaf/node domain separation (`0x00`/`0x01`), tree shape and
+    proof algorithms. Off-the-shelf CT verifiers and the customer's own tool can then check it.
+  - Verification depends only on record bytes, never on understanding the record type.
 - Each head is sealed via Cloud KMS, AWS KMS or an HSM, and **co-signed by a customer-held witness key**, so 3AM can't
   rewrite history.
+  - Signing is batched per head, not per record.
+  - Each head records its key version. Key history is itself ledgered, and a verifier accepts any key valid at the
+    head's time. So rotation never breaks old proofs.
+- **Receipts with a maximum merge delay (MMD).** Every party that hands keel a record gets a signed promise of
+  inclusion within the MMD: an approver, a runner reporting a commit, or a DBA running a book package. `auditor`
+  and the customer can demand an inclusion proof for every receipt.
+- **A fresh signed head at least every MMD**, even when idle. A missing head is an alert.
+- **Gossip, so 3AM can't show different histories to different parties** (a split view).
+  - Every party that sees heads keeps the largest verified head: console, runners, `3am-run`, `auditor`, `vet` and
+    the witness.
+  - Parties exchange (head, newer head, consistency proof) in existing RPC metadata. No new service.
+- **The witness enforces as well as signs.** It stores every head it signs and refuses to co-sign one that isn't
+  consistent with the last.
+  - Two conflicting signed heads are self-proving. They open an incident against 3AM itself, raised to the
+    customer.
+  - A head stale beyond the MMD is a warning, which needs confirmation before it is reported.
+- **Merkle aggregation** over shard, incident and class (books vs operational) makes "every write to shard X" a
+  provably complete query. That is the question a bank auditor asks.
 - The legacy hash chain and its Ed25519 segments still verify inside it.
 
 **IDs and time:**
@@ -214,8 +270,19 @@ The control plane never touches a database. Every cloud VPC or account and every
 - Ordering within a plan uses the etcd revision, never wall clocks.
 - Every runner event carries three timestamps: occurred-at and sent-at on the site clock, received-at on the control
   clock. Site clock offset is estimated continuously.
+- **Clock uncertainty ε is measured, never assumed** (Corbett et al. 2012, TrueTime).
+  - Each runner polls several sources: the cloud time service, the control-plane clock and on-prem NTP.
+  - It rejects outliers Marzullo-style, and ε grows linearly with time since the last sync.
+  - Events carry ε, and `infer` widens their intervals.
+- **Leap-second smearing differs by source.** GCP and AWS smear; plain NTP steps. Around a leap second they can
+  disagree by ~0.5 s, beyond the gate. Each site records its time-source type, and a leap-second window counts as
+  high uncertainty.
+- **Precedence is defined as `C.latest < O.earliest`.** Overlapping intervals mean "order uncertain".
+- Within a shard, ordering uses log positions (LSN, GTID), not DB clock timestamps.
 - Leases use monotonic durations measured locally.
-- A runner more than ±250 ms off is refused write steps.
+- The keel lease length is chosen from the halt-latency requirement. A hard leader loss pauses waves for up to one
+  lease, which is safe because of the fence, and visible in the console.
+- A runner more than ±250 ms off, or with ε above the gate, is refused write steps.
 
 **End-to-end operation ID** (DDIA ch. 12):
 - Minted at the approver's click or CLI command.
@@ -226,7 +293,68 @@ The control plane never touches a database. Every cloud VPC or account and every
 - Probes return summaries (counts, capped IDs, hashes), never raw rows.
 - Before-images are encrypted per incident under a data key wrapped by the customer's KMS. At retention end the key is
   destroyed (**crypto-shredding**), so the ledger keeps the hashes and the content is gone.
+- **Why crypto-shredding is the only real deletion** (Gutmann 1996):
+  - Overwriting in place is unreliable on SSDs and cloud object stores. Wear levelling, remapped blocks, replicas,
+    snapshots and backups all keep old copies.
+  - So the rule covers **every place plaintext could land**: runner scratch and temp files; clone and rehearsal
+    databases, on customer-KMS volumes and destroyed by key or volume deletion, never by `DROP`; core dumps; swap.
+  - Data keys live in locked memory, are short-lived and are zeroised after use.
+  - The KMS key-destruction event is **ledgered**, so deletion is provable, not promised.
+- NATS streams, Postgres projections and logs never carry raw row values.
 - No PII goes to any model outside the customer boundary.
+
+**CDC contract** (Andreakis & Papapanagiotou 2020; Andreakis 2026, Generalized DBLog):
+- **No CDC operation may take a table lock or global read lock on a customer DB.** Debezium runs incremental
+  (watermark) snapshots only, never the legacy locking snapshot.
+- **The source must provide:**
+  - a commit-ordered log;
+  - positions that denote log prefixes;
+  - stable row identity;
+  - full row images;
+  - complete chunk reads;
+  - enough retention.
+- **Per engine:**
+  - **Postgres.** A commit record can reach the WAL before the transaction is visible to new snapshots, so a chunk
+    read can miss it and a deleted row can be **resurrected**. Chunk reads therefore compare their own snapshot
+    (`pg_current_snapshot()`) and widen the window until it covers everything before the low watermark. Tables
+    whose events feed evidence use `REPLICA IDENTITY FULL`.
+  - **SQL Server.** Chunk reads run under SNAPSHOT/RCSI. Locking READ COMMITTED can skip or double-read rows.
+  - **MySQL.** GTID mode and `binlog_order_commits` on; multithreaded replicas preserve commit order.
+- **Chunk reads run on the primary**, or on a replica only after its replay position is confirmed past the low
+  watermark.
+- **The watermark table is a 3AM-owned write in each shard**, alongside `_threeam.fence` and `_threeam.applied`
+  (open question 3). Where writes are refused, the fallback is MySQL's read-only GTID variant.
+- **A failover with a discontinuous position history** invalidates CDC-derived evidence for that shard until its
+  units are rebuilt. This extends invariant 11: fail closed and rebuild.
+- **Replay into a populated sink** clears the repaired scope or uses tombstones. Projections rebuild into a fresh
+  table and swap.
+- **Polling `updated_at > t` is outside the contract.** It can't see deletes, and its stamps aren't commit-ordered.
+- **Per-table change rates from CDC are free Detect signals**, for example the insert rate dropping after a deploy.
+  They cost no query against the customer DB.
+
+**The LLM boundary** (Greshake et al. 2023; Ruan et al. 2024; Saltzer & Schroeder 1975 on confinement):
+- **Everything the reasoner reads may be attacker-written**: DB rows, log lines, error text, tickets, commit
+  messages, column comments, runbooks. Retrieved text acts like code. Prompt instructions and filters are not
+  controls: even the best safety-prompted agent failed 23.9% of ToolEmu's cases.
+- **Structural controls:**
+  - **No egress.** No URL fetch, web search or email, which blocks exfiltration by side effect, multi-stage payloads
+    and remote control.
+  - **No memory across incidents**, so an injection can't persist. Learned knowledge enters only through
+    human-reviewed packs.
+  - **Templated read tools only**, with bound parameters. The reasoner never composes free queries, so its reads
+    can't become a covert channel.
+  - **Verbatim values, enforced mechanically.** Every literal in a draft must byte-match an evidence ID, or the draft
+    is refused.
+  - **Ambiguity fails.** A target key that resolves to more than one row, tenant or payee fails the scope probe.
+    Drafts never pick with `LIMIT 1` or "the first match".
+  - **Hidden-text stripping.** Zero-width characters, homoglyphs, Base64 blobs and HTML/Markdown comments are
+    stripped or flagged before evidence reaches the model, and what was stripped is logged.
+  - **Budgets.** Each call has a time and token budget. When it runs out, the system records "reasoner unavailable"
+    and falls back to pack templates, so injection can't stall an incident.
+- **LLM judges are advisory only.** ToolEmu's evaluator agreed with humans at κ ≈ 0.48 with 73% recall: good for
+  finding failures in testing, far too weak to gate anything.
+- **LM-emulated environments may red-team the reasoner, but never produce evidence.** Emulated outcomes are not
+  observations. madsim and fleetlab remain the only test truth.
 
 ## Repositories
 
@@ -235,6 +363,7 @@ The control plane never touches a database. Every cloud VPC or account and every
 | `3am-proto` | APIs, events and ledger schemas; generated clients for Go, Rust, TypeScript and Python |
 | `3am-safety` | Rust workspace: keel, runner, sqlguard, `3am-run`, ledger (Merkle log + legacy verifier), broker, sim (madsim), spec/ (TLA+), hermitage/ (isolation conformance) |
 | `3am-control` | Go: control plane + `auditor` (separate binary, separate review owners) |
+| `3am-vet` | Go: the diverse pre-apply checker. Its own repo, with an owner who doesn't write keel or runner. Written from the TLA+ invariants, not from keel's code |
 | `3am-cloud` | Go cloud layer (apigen, action cards, change ingesters) |
 | `3am-research` | Python: `infer` (deterministic stats) and `reasoner` (LLM), packaged as separate images |
 | `3am-packs` | Signed `pack.v2` packs: declarative probes, scope rules, mediator probes, fix templates, verify probes |
@@ -286,6 +415,15 @@ Each stage's output is a content-addressed artefact you can open, diff and re-fe
 **Alerts:**
 - A loss matrix sets the thresholds; a missed payroll fault and a false page are priced explicitly (ESL ch. 2).
 - Every threshold is chosen on held-out incidents, never on the ones it is scored against.
+- **Conformal intervals on the residuals** (Shafer & Vovk 2008). Split-conformal calibration on held-out windows
+  gives each alert a stated false-alarm rate, with no distributional assumption beyond exchangeability.
+  - Windows with seasonality and deploys aren't exchangeable. Calibration is therefore **Mondrian**: per
+    payroll-cycle phase and per incident class.
+  - It is redone after every release. An exchangeability test runs on the calibration set; when it fails, the
+    alert says "uncalibrated".
+  - Low **credibility** (the input is unlike every past window) feeds the reject option.
+  - Wording is about the procedure: "this detector is wrong ≤ 5% of the time", never "95% chance this shard is
+    affected".
 
 ### 1. Scope (under 1 min, the whole population, always)
 
@@ -295,11 +433,15 @@ Each stage's output is a content-addressed artefact you can open, diff and re-fe
 - Probes go to the replica by default. Each returns a summary plus the **observed position** (replay LSN, AG LSN or
   GTID set).
 - A fleet scope is a **vector of per-shard positions**, never "a point in time" (DDIA ch. 5).
+- **Each per-shard claim is coordinate-bound.** The probe runs in one statement snapshot whose position is
+  recorded in the same transaction: Postgres `pg_current_snapshot()` plus replay LSN; MySQL the GTID set. Without
+  that, "clean at position P" has no defined coordinate (Generalized DBLog).
 
 **Limits:**
 - 5 s statement timeout, 100 ms lock timeout, a row cap, and an `EXPLAIN`-proven index path.
 - At most k probes in flight per DB server, with a priority queue in front so incidents beat steady state (Xu ch. 9).
-- Each shard has its own deadline. A shard past its deadline is **Unknown**, and late results merge in as corrections.
+- Each shard has its own deadline. A shard past its deadline is **Unknown**. Late results merge in as ledgered
+  corrections only if their epoch is current (invariant 15).
   Latency is stored as HDR histograms, which are added, never averaged (DDIA ch. 1).
 
 **Output:** Affected / Clean / Unknown. Unknowns are tested for being *informative*: does unreachability itself
@@ -344,24 +486,50 @@ shards and missing outcomes (Manski bounds with Imbens–Manski intervals).
 | Rung | Evidence | Verdict | Granted by |
 |---|---|---|---|
 | 5 | **Intervention.** A designed clone experiment (spec in Rehearse) whose exact Fisher randomization test gives p ≤ 0.01, with the test achieving that bound at least once *before* it runs. Or a **natural experiment**: a randomised rollout (tenant-hash bucket) analysed as ITT/CACE, or a threshold rollout analysed by regression discontinuity. | **Proven** | runner (clones), `infer` (FRT, IV, RD) |
-| 4 | **Mechanism (front-door).** A row-level mediator probe ties the bad rows to the writer: release/build ID, `job_run_id`, audit columns or CDC source metadata. Plus temporal precedence, evaluated with **clock-uncertainty intervals**: overlap means "order uncertain", which is not proof. | **Proven**, with a "relative to observed variables" caveat | runner probes |
-| 3 | **Invariance.** ICP across sites, clouds, DCs and time windows, giving a parent set with 1−α coverage. **Plus** an adjusted differential that passes the statistical honesty rules below. | **Supported**: draft and rehearse only | `infer` |
+| 4 | **Mechanism (front-door).** A row-level mediator probe ties the bad rows to the writer: release/build ID, `job_run_id`, or CDC source metadata with its LSN. Plus temporal precedence, evaluated with **clock-uncertainty intervals**: overlap means "order uncertain", which is not proof. Audit columns (`updated_at`, `modified_by`) alone count as Supported at most. They can't see deletes and aren't commit-ordered, so they need corroboration from the log (Generalized DBLog). | **Proven**, with a "relative to observed variables" caveat | runner probes |
+| 3 | **Invariance.** ICP across sites, clouds, DCs and time windows. The selected set is **contained in** the true parents with probability ≥ 1−α, relative to observed variables, with no hidden confounding and no selection. It does *not* say every parent was found (Peters, Bühlmann & Meinshausen 2016). **Plus** an adjusted differential that passes the statistical honesty rules below. | **Supported**: draft and rehearse only | `infer` |
 | 2 | **Adjusted association.** A differential stratified by the topology's backdoor set (site, cloud, server, engine version, tenant-size band, shard age), never adjusting for descendants of the suspect. Raw and adjusted effects are shown side by side, and a sign flip (Simpson's paradox) is flagged. | **Correlated**: the investigation continues and the DBA sees the gaps | `infer` |
 | 1 | Raw association or temporal coincidence; LLM hypotheses; Granger-style lag tests | **Hypothesis** | reasoner |
 
 **Statistical honesty rules for `infer`** (ESL ch. 3, 7, 8, 11, 18):
 - **Charge for the search.** The differential tests hundreds of attributes, so the effective degrees of freedom far
   exceed the number of features in the final rule. Significance comes from a **permutation null**: shuffle
-  affected/clean labels *within strata*, then compute plug-in FDR and q-values (Benjamini–Hochberg equivalent). Local
-  fdr is reported as the posterior probability that an attribute is null, which feeds the Bayesian engine.
-- **Decoys.** Knockoff attributes (column-permuted copies of real attributes) are injected into every differential.
-  If a decoy ever ranks as a candidate cause, the run is miscalibrated and is capped at Correlated (the NIPS-2003
-  "artificial probes" lesson).
+  affected/clean labels *within strata*, then compute plug-in FDR and q-values. Local fdr is reported as the
+  posterior probability that an attribute is null, which feeds the Bayesian engine.
+  - BH is only guaranteed under independence or PRDS, and correlated attribute tests satisfy neither. So the
+    *selection* uses knockoff+ (below), with Benjamini–Yekutieli as the stated fallback. BH q-values are shown as
+    descriptive only.
+  - Asymptotic logistic/GLM p-values are never reported once p/n ≳ 0.1. With 257 shards and 30+ attributes that is
+    always the case: about 17% of null p-values fall below 0.05 (Candès et al. 2018).
+- **Decoys are model-X knockoffs, never permuted copies** (Barber & Candès 2015; Candès et al. 2018).
+  - A column-permuted copy keeps its own distribution but loses its correlation with the other attributes. So a
+    real correlated null beats it easily: 45.6% FDR at a nominal 20% in their simulation. A decoy check built that
+    way gives false reassurance.
+  - Knockoffs are therefore *sampled* from a model of the attribute distribution, which the inventory history
+    provides. Each knockoff is exchangeable with its original given all the others: second-order (mean and
+    covariance) knockoffs, with approximate SDP on a block-diagonal covariance.
+  - **Selection uses the knockoff+ threshold**, which gives exact FDR under arbitrary correlation. Plain knockoff
+    overshoots in the 1–3-discovery regime RCA lives in.
+  - If a knockoff still ranks as a candidate cause, the run is capped at Correlated (the NIPS-2003 "artificial
+    probes" lesson).
+  - Knockoffs are random draws. They are redrawn R times, and each candidate's selection frequency is reported.
+  - **Co-rolled attributes use group knockoffs**: the selection unit is the group {release R, flag F}.
+  - **Where an attribute was randomised** (tenant-hash rollout), its conditional distribution is known exactly. The
+    conditional randomization test for it *is* the FRT below: same idea from two directions.
+  - Model-X assumes i.i.d. rows. It is used only within strata where shards are exchangeable given the topology.
+    Design-based claims over the finite 257 stay with the FRT.
 - **Discover on one half, confirm on the other.** Sample splitting over shards or time windows; selection happens
   only on the discovery half. Standard errors after model search are invalid otherwise.
-- **Stability.** Bootstrap the whole pipeline, screening included, over shards and windows. The verdict's stability
-  is the fraction of resamples that pick the same parent set. Votes are not probabilities, so they are calibrated
-  before display.
+- **Stability selection with stated error control** (Meinshausen & Bühlmann 2010; Shah & Samworth).
+  - The whole pipeline, screening included, runs on **complementary pairs** of disjoint halves.
+  - The resampling unit is the **whole interference group and time block**, never individual shard-windows. Shards
+    that share a server are dependent, and windows are autocorrelated, so smaller units overstate stability.
+  - q and the threshold are chosen so the bound E[falsely selected] ≤ q²/((2π_thr − 1)p) is ≤ 1 (or a stated α).
+    The bound is reported.
+  - Frequencies are computed for **groups** of correlated attributes too. Near-duplicates split their votes and can
+    both fall below the threshold. The verdict then says "{release R, flag F}: stable as a group; separation needs
+    rung 4/5".
+  - Votes are not probabilities, so they are calibrated before display.
 - **Correlated suspects can't be separated by statistics.** When release and flag were co-rolled on the same shards
   (the irrepresentable condition), lasso, ICP and trees cannot tell them apart. The verdict says so, and only rung 4
   or 5 can resolve it. Grouped or elastic-net penalties keep correlated attributes together rather than picking one
@@ -423,6 +591,22 @@ shards and missing outcomes (Manski bounds with Imbens–Manski intervals).
   finite population. Superpopulation (IID) inference is reserved for cross-estate learning. A lab result has
   internal validity only: it transfers to a customer only after that estate's own shadow record.
 
+**ICP rules for `infer`** (Peters, Bühlmann & Meinshausen 2016, and its discussion):
+- **Environments are exogenous**, never descendants of the outcome. Sites, clouds, DCs and calendar windows qualify.
+  "Shards that alerted", "reachable shards", "shards with a ticket" and "shards a DBA already patched" are refused,
+  the same Berkson ban as in Scope.
+- **Informative Unknowns cap rung 3.** If unreachability correlates with the fault, ICP on the reachable shards
+  conditions on a selection variable. That is the case where ICP turns anti-conservative, so the verdict is
+  capped, not just flagged.
+- **Interventions on the outcome** happen: a DBA hotfix, an earlier partial repair, a regional rollback. Run ICP on
+  **pairs of environments** and take the multiplicity-adjusted union. Exclude environments the ledger shows were
+  repaired.
+- Method II (residual invariance) is the default. Lasso pre-screening, |S| ≤ 3, and the screening step are recorded
+  in the analysis record, because pre-screening costs α (coverage becomes 1−2α).
+- **"Every set rejected" is a signal**: no invariant explanation among the observed attributes. It feeds the
+  missing-topology detector as "hidden cause or intervention on the outcome likely".
+- With one environment, ICP claims nothing: the empty set is always invariant.
+
 **Interference and hidden structure:**
 - **SUTVA** fails for shards that share a server, replica set or storage. Those form an **interference group**, which
   is the unit for canaries and for transfer of results (ECI ch. 6.9).
@@ -444,7 +628,8 @@ shards and missing outcomes (Manski bounds with Imbens–Manski intervals).
 
 **Bindings:**
 - A parameterised script with per-shard bindings taken verbatim from probe output.
-- The source is a pack template, or the reasoner with values verbatim.
+- The source is a pack template, or the reasoner with values verbatim. The verbatim rule is checked mechanically:
+  each literal must byte-match an evidence ID (see "The LLM boundary").
 - Book tables get compensating-entry templates.
 
 **Build, then swap** (DDIA ch. 10):
@@ -461,7 +646,9 @@ shards and missing outcomes (Manski bounds with Imbens–Manski intervals).
 - An indexed access path, proven by `EXPLAIN`.
 - Single atomic `UPDATE … SET col=f(col) WHERE <proof> AND <guard>`; never read-modify-write in the runner.
 - An exact expected rowcount per shard plus a hard cap.
-- PK-range batches sized under ~1 s.
+- PK-range batches sized under ~1 s. Each fix transaction has a time and row budget, and larger scopes are chunked
+  with a marker per chunk. A long `FOR UPDATE` premise re-check holds locks on a payroll DB (FoundationDB's 5 s
+  rule).
 - A derived `SELECT … FOR UPDATE` before-image.
 - An inverse guarded on "current value = after-value".
 - **Per-engine isolation:**
@@ -508,6 +695,8 @@ falsified** and the verdict drops to Unproven.
     *not* reproduce it.
 - **Fixed in advance:** the design, the randomisation seed, the assignment and the test statistic are ledgered
   before the experiment runs. The runner randomises; the reasoner never chooses the assignment.
+- **Each clone and its results are an immutable, ledgered DataSet**, so "which clone proved this" stays answerable
+  (Helland 2015). A clone is destroyed by key or volume deletion.
 
 Clone cost is budgeted per incident, and Design A is preferred.
 
@@ -516,9 +705,21 @@ Clone cost is budgeted per incident, and Design A is preferred.
 - The plan is immutable (`plan_hash`) and approved under the two-person rule (invariant 2).
 - Each approval records the **hash of the exact view the approver saw**: scope table, rehearsal diff, evidence IDs,
   policy version, the reasoner output, and whether it was vetoed (DDIA ch. 12, reads are events).
+- **The approval view puts deterministic evidence first.**
+  - The scope table and rehearsal diff are rendered above any LLM text and are never summarised by it.
+  - Reasoner prose is labelled untrusted.
+  - LLMs write persuasive, well-cited, wrong summaries (Greshake et al. 2023). Two humans must not rubber-stamp a
+    narrative.
 - The scope is re-probed at start, and drift invalidates the approval.
 - **Versioned inputs** are pinned, and a later change to any of them is drift: the routing-directory version (DDIA
   ch. 6), flag config, schema, pack and policy (DDIA ch. 11, time-dependent joins).
+  - Every safety decision references a **version ID, never a mutable name** like "current pack" or "latest policy"
+    (Helland 2015).
+- **Prescripts** (Saltzer & Schroeder 1975):
+  - Approval expiry is one.
+  - Add a **cooling-off delay** on edits to declared book tables, change packages and approver groups.
+  - Add a **customer-designated "court order" principal**, whose signal is required to unlock break-glass.
+- **Complete mediation.** Cedar decisions are re-evaluated at execution. Any cache of them has a short, stated TTL.
 
 ### 9. Execute in waves
 
@@ -535,14 +736,18 @@ Clone cost is budgeted per incident, and Design A is preferred.
 **Per-shard protocol:**
 1. keel commits `INTENT(op_id, plan, shard, step, attempt, fence)`.
 2. The runner checks it is on the writable primary and records server identity and timeline.
-3. It exchanges its capability for a JIT credential.
+3. `vet` checks the step independently and signs a step token (invariant 17). The runner exchanges its capability
+   plus that token for a JIT credential. The broker refuses unless it gets both.
 4. `BEGIN` → timeouts → fence update (invariant 6) → premise re-check (5) → encrypted before-image → statement →
    assert rowcount → post-check → marker (7) → `COMMIT`.
-5. keel records `OUTCOME`.
+5. keel records `OUTCOME`. `vet` reads the marker and checksum back from the shard; a mismatch halts the next wave.
+6. If a runner's session with keel dies, every later step of that plan on that runner fails. So the plan ends as
+   "steps 1..k done, rest not started", never with gaps (Chubby's suffix-only loss).
 
 **Halts:**
 - Halt triggers: rowcount mismatch, canary failure, failed verification, health regression, replication lag, drift,
-  failover (11), the window ending, lease loss, a **Degraded** runner, or a human halt (console, CLI or Slack).
+  failover (11), the window ending, lease loss or **jeopardy**, a **Degraded** runner, a `vet` refusal or mismatch,
+  or a human halt (console, CLI or Slack).
 - A **Degraded** runner is one whose latency falls far outside its own phi-accrual history: a gray failure whose
   waves pause and whose shards turn Unknown (DDIA ch. 8).
 - Committed shards are never auto-reverted unless that was pre-approved. Otherwise the inverse is a new plan that
@@ -583,6 +788,9 @@ Clone cost is budgeted per incident, and Design A is preferred.
 - **AWS:** `AssumeRole` with a session policy for `rds-db:connect` on those resource IDs.
 - **On-prem:** an OpenBao/Vault dynamic user.
 - Credentials never leave the site, and TTLs are the second line of defence after the fence, never the first.
+- **This is a capability system issued from an ACL (Cedar)** (Saltzer & Schroeder 1975). So revoking a credential
+  already issued is not immediate: **revocation latency = TTL**. TTLs are sized from that. A mid-wave revoke works
+  through halt plus the fence, not through credential expiry.
 
 ## Learning and trust, statistically honest
 
@@ -650,6 +858,11 @@ Clone cost is budgeted per incident, and Design A is preferred.
 - A one-time enrolment token, then 24 h certificates from a KMS-backed CA.
 - Disconnected sites keep *reading* and buffer their events durably. They hold no write authority; leases lapse and
   their shards show as Unknown.
+- **Lease renewal gets its own deadline over the relay.** It has a separate prioritised stream with HTTP/2 PING
+  keepalives and an explicit timeout. TCP congestion back-off can silently outlast a lease (Chubby moved
+  KeepAlives off TCP for this). It is measured in chaos tests under packet loss.
+- Every component degrades rather than crashes when keel or etcd is briefly unavailable: reads continue and writes
+  pause.
 - Writes and authority are consistent; reads are available and labelled stale (DDIA ch. 9, CAP per operation).
 
 ## Console, CLI, API, Terraform
@@ -664,11 +877,12 @@ Clone cost is budgeted per incident, and Design A is preferred.
   Actions menu. Suggestions come from precomputed per-project indexes (Xu ch. 13).
 
 **Incident tabs:**
-- **Overview, Scope** (the per-shard position vector, Unknowns), **Proof** (rung badge, raw vs adjusted, q-values,
-  decoy check, stability, assumptions).
+- **Overview, Scope** (the per-shard position vector, Unknowns), **Proof** (rung badge, raw vs adjusted, knockoff+
+  selections with selection frequency, stability with its error bound, assumptions).
 - **Plan, Rehearsal** (clone experiments), **Approvals** (the view hash), **Execution** (a live wave grid with an
   always-visible Halt).
-- **Verification** (Merkle roots), **Ledger** (inclusion proof), **YAML**.
+- **Verification** (Merkle roots), **Ledger** (inclusion proof, receipt status, head-gossip state), **YAML**.
+- Ledger warnings ("head stale beyond MMD") are kept separate from proofs ("two signed heads disagree").
 
 **Labels and behaviour:**
 - Visible badges for "mitigation, not repair", "order uncertain" and "not identified".
@@ -687,6 +901,8 @@ Clone cost is budgeted per incident, and Design A is preferred.
 **HA and DR:**
 - Regional GKE/EKS across 3 zones; etcd with 3 voters (5 for banks); NATS R3; Postgres HA.
 - keel voters never span regions or clouds.
+- Changing from 3 voters to 5 is a scripted, tested procedure: add learners, then a joint-consensus membership
+  change. It is never done by hand (Ongaro & Ousterhout 2014).
 - Warm DR is a **separate cluster with human-initiated failover**, which halts every plan and reconciles from shard
   markers.
 
@@ -695,19 +911,63 @@ Clone cost is budgeted per incident, and Design A is preferred.
 - WaveExecution: AtMostOnceApply, FenceMonotonic, NoStartAfterHalt, PremiseInTxn, liveness.
 - CredentialLifecycle.
 - LedgerChain/LogConsistency.
-- Each property is classed as safety or liveness.
-- Lab and simulation traces are validated against the specs.
+- CdcMerge: the Generalized DBLog contract for the CDC pipeline.
+- Each property is classed as safety or liveness. Liveness is **checked**, not only stated, under explicit
+  fairness.
+- **The invariants are written in TLA+ before code** (M1 step 2). Most errors come from ambiguous English
+  (Lamport et al. 2002).
+- **The small-instance blind spot.** TLC is feasible only for 2–3 runners and shards. AtMostOnceApply,
+  FenceMonotonic and TwoPersonRule therefore get an **inductive invariant** checked by Apalache or TLAPS. TLC random
+  simulation covers larger N.
+- Third-party parts are modelled at their **documented contract**, as reusable modules: etcd as linearizable CAS
+  plus leases and revisions; each engine at its Hermitage-verified isolation; NATS as at-least-once and
+  per-partition order. They are never modelled at their internals.
+- **Traces flow both ways.** Lab and simulation traces are validated against the specs. TLC counterexamples and
+  coverage-directed random traces become scripted madsim schedules.
 
-**Deterministic simulation (madsim):**
+**Deterministic simulation (madsim)** (Zhou et al. 2021, FoundationDB; Deligiannis et al. 2016, P#):
 - 3 keel nodes, N runners, 257 in-memory shards with real transaction, fence and marker semantics.
+- madsim can't simulate etcd's internals, so the store is modelled by its contract. The chaos/Jepsen tier covers
+  the real store.
 - Faults: crashes, partitions, fsync loss, clock skew, slow DBs, **a lost ack after COMMIT**, **a process paused past
-  its lease that then tries to commit**, **failover with a lost async tail**.
+  its lease that then tries to commit**, **failover with a lost async tail**, **a late report from a superseded
+  epoch**.
+- **Buggify points** in keel, runner and `vet` force rare-but-legal behaviour: spurious errors, delays, odd tuning
+  values.
+- **Swarm testing:** each run randomises voters (3/5), runner and shard counts, fault rates and which buggify points
+  are on.
+- **Coverage counters** for each named case, with a CI gate requiring each to be reached ≥ N times nightly, so
+  "1M seeds clean" can't hide a case never exercised.
+- **A PCT-style priority scheduler** runs alongside random seeds. In the P# study, random scheduling alone missed
+  4 of 11 bugs.
+- **Oracles:**
+  - workload invariants: marker count = applied steps; fence monotone; no write without two approvals;
+  - **hot/cold liveness monitors**: every halt is reconciled, every Unknown resolves via the marker, every approval
+    expires;
+  - a **sequential reference model** of "apply plan to shards", compared at each marker commit.
+- **Design-fault mutants.** Inject a wrong fence comparison, an off-by-one in scope, or a skipped premise re-check
+  into keel and runner, and measure how many `vet` and `auditor` catch. That measures diversity instead of
+  assuming it.
+- **Halt-and-reconcile is the only error path**, so it is the most-exercised one. Failover code is where the bugs
+  live (Chubby).
+- Production incidents are reproduced in madsim first, then fixed.
 - Millions of seeds nightly.
 
 **Chaos and history checks:**
 - Chaos Mesh: kill the keel leader mid-wave, kill a runner mid-commit, SIGSTOP a runner past its lease, partition the
   relay, revoke a credential mid-wave, fail over a shard mid-wave.
 - Jepsen-style history checks against markers, fences and checksums.
+- **An upgrade drill** next to the failover and restore drills. Chubby's data losses came from software bugs and from
+  operator upgrades meant to fix them.
+
+**Adversarial reasoner corpus** (Ruan et al. 2024; Greshake et al. 2023):
+- Cases use ToolEmu's schema: underspecification, expected achievement, risky outcomes and risky actions.
+- An adversarial evidence emulator plants near-duplicate tenants, shards and payees, similar column names, and
+  plausible but wrong probe output.
+- **Injection payloads arrive through evidence channels** (DB rows, logs, tickets), not the prompt. They cover
+  exfiltration, wrong summaries, multi-stage, encoded and availability attacks.
+- Each case is scored on whether verbatim-check, sqlguard, veto or `vet` caught it.
+- It runs as a regression suite on every change of model, prompt or pack version.
 
 **Hermitage suite:** isolation anomalies (lost update, write skew, phantoms) are checked per engine and version in
 fleetlab, and the result gates the runner.
@@ -753,6 +1013,14 @@ fleetlab, and the result gates the runner.
 | `+noncompliance` | The flag is assigned to 60% of tenants, but only 20% ran a pay cycle. ITT/CACE reported; FAR interval used |
 | `+confounded-hidden` | A hidden shared SAN drives both the release wave and the defect. Negative controls or sensitivity (low Γ*) must block Supported; the missing-topology detector proposes the SAN |
 | `+post-treatment-trap` | The naive analysis conditions on "shards whose job ran" and flips the sign. `infer` must refuse that adjustment set |
+| `+knockoff-calibration` | Strongly correlated null attributes (ρ ≈ 0.3–0.9). Permuted decoys would pass here; model-X knockoff+ must hold FDR ≤ q over many seeds |
+| `+repaired-env` | A DBA hotfixed some shards mid-incident. ICP must exclude that environment or use pairwise environments, never name a non-cause |
+| `+pg-resurrect` | A Postgres transaction commits in the WAL before it becomes visible. CDC must not resurrect the row it deleted, and verify must not pass on a resurrected row |
+| `+sqlserver-skip` | Concurrent updates move rows mid-scan. Chunk reads under locking READ COMMITTED would skip them; SNAPSHOT reads must not |
+| `+late-report` | A runner whose lease expired delivers a stale ack after its shard is reassigned. It is quarantined, never merged |
+| `+leap-smear` | GCP/AWS smear and on-prem NTP steps across a leap second. Precedence must read "order uncertain", never Proven |
+| `+evidence-injection` | Instructions planted in a tenant row, a log line and a ticket. The reasoner's proposal may change, but no gate passes it and nothing leaves the boundary |
+| `+relay-loss` | Packet loss on the relay. Lease renewal must keep its deadline or enter jeopardy, and the count audit must find any missing event |
 | `stuck-flag-38` (operational) | Same scope, but an operational fix exercises the executor end to end |
 | `gl-38` (books) | Compensating entries go out as a change package; a human runs it via (a) and (b); 3AM verifies 38/38 |
 
@@ -762,18 +1030,18 @@ fleetlab, and the result gates the runner.
 |---|---|---|
 | 0 | Proto repo, CI, cosign/SBOM, Terraform skeletons for GCP and AWS, ConnectRPC API, `3am version` | CLI ↔ API through Workload Identity / Pod Identity; signed images |
 | 1 | Fleetlab + variant catalogue + injector + scorer with vaulted truth | `inject <variant> --seed N` is deterministic; the scorer is the only reader of the truth; idle cost documented |
-| 2 | **Spike (1 week): etcd vs FoundationDB for keel.** Then keel v0: event-sourced commands, leases, fence = revision, halt, Merkle ledger + legacy verifier, policy golden replay. TLA+ and madsim. | TLC green; ≥1M seeds clean, including the paused-past-lease case; 0 divergences replaying `policy.py` (McNemar p = 1) |
+| 2 | **Spike (1 week): etcd vs FoundationDB for keel.** The tie-breaker is the narrower, better-documented contract, because madsim models the store by contract. Invariants written in TLA+ first. Then keel v0: event-sourced commands with op IDs, leases, epoch, fence = revision, halt, RFC 6962 Merkle ledger with receipts, gossip and witness + legacy verifier, policy golden replay. TLA+ and madsim with buggify, swarm, coverage counters and PCT. Budget: ~2 person-weeks for a focused harness, months for a reusable environment model (P# data). | TLC green; Apalache inductive invariant for the core safety properties; ≥1M seeds clean with every named case's coverage counter reached; liveness monitors cold; 0 divergences replaying `policy.py` (McNemar p = 1); witness refuses an inconsistent head |
 | 3 | runner + relay + sqlguard v0 (read-only) on GCP, AWS and on-prem; replica routing with positions; phi-accrual liveness; Hermitage suite for Postgres | 257-shard probe p95 < 15 s and p99 reported; zero inbound on-prem; Unknowns correct; guard corpus of 200+ scripts passes; Hermitage green |
-| 4 | Inventory + change streams + rollout system + versioned dimensions + shard/tenant catalogue (Postgres facts and cubes) | Release and flag changes visible within 60 s; catalogue lists 257 shards and their tenants; event-time watermarks correct under a simulated partition |
-| 5 | Detect + scope + describe + `infer` (rungs 1–3: FRT, negative controls, sensitivity, overlap, IV and RD) + mediator probes (rung 4) | Over all variants × 20 seeds: 38/38 with 0 false positives in < 60 s; rule P = R = 1; decoys never above Correlated; `+co-rolled` never Proven without rung 4/5; `+simpson` flagged; `+null` false Supported ≤ α with a CI; `+unknown-informative` flagged; `+no-overlap`, `+confounded-hidden` and `+post-treatment-trap` blocked correctly; `+threshold` and `+noncompliance` correct within CI; every verdict's analysis record ledgered before its outcome probes |
+| 4 | Inventory + change streams + rollout system + versioned dimensions + shard/tenant catalogue (Postgres facts and cubes) + CDC under the contract | Release and flag changes visible within 60 s; catalogue lists 257 shards and their tenants; event-time watermarks correct under a simulated partition; `+pg-resurrect` and `+sqlserver-skip` pass; no CDC lock taken; relay count audit clean |
+| 5 | Detect + scope + describe + `infer` (rungs 1–3: FRT, negative controls, sensitivity, overlap, IV and RD) + mediator probes (rung 4) | Over all variants × 20 seeds: 38/38 with 0 false positives in < 60 s; rule P = R = 1; knockoffs never above Correlated; `+knockoff-calibration` FDR ≤ q with a CI; `+repaired-env` correct; `+leap-smear` "order uncertain"; stability error bound reported; `+co-rolled` never Proven without rung 4/5; `+simpson` flagged; `+null` false Supported ≤ α with a CI; `+unknown-informative` flagged; `+no-overlap`, `+confounded-hidden` and `+post-treatment-trap` blocked correctly; `+threshold` and `+noncompliance` correct within CI; every verdict's analysis record ledgered before its outcome probes |
 | 6 | Draft + sqlguard + rehearsal on clones (Cloud SQL clone, Aurora/RDS snapshot clone, rolled-back on-prem) + clone experiments A/B/C (rung 5) + encrypted before-images + inverse + compensating templates | Counts equal expected 100%; second run 0 rows; inverse restores the checksum; `+randomised` and clone experiments reach Proven with exact p ≤ 0.01; placebo clones never reproduce; designs below the achievable-p bound refused; guard blocks 100% of a mutation suite |
 | 7 | Two-person approval (Cedar, WebAuthn; console, CLI, Slack); view hash; operation ID; drift invalidation | Self, author, modified-plan, expired and drifted approvals all refused; approvals and view hashes verify offline from the ledger |
-| 8 | Executor: containment gate, interference-group waves, celebrity ordering, fence in DB, premise re-check, marker, JIT credentials (GCP conditional IAM, AWS session policy, OpenBao), halt, verify with Merkle roots | **38/38 verified, 219 untouched**. Chaos runs (leader kill, runner kill, SIGSTOP past lease, credential revoke, `+failover`) each resume or halt with **0 double-applies and 0 stale-fence commits**. `+bleeding` blocked. No credentials left behind. |
+| 8 | Executor: containment gate, interference-group waves, celebrity ordering, fence in DB, premise re-check, marker, `vet` pre-apply check and read-back, jeopardy state, JIT credentials (GCP conditional IAM, AWS session policy, OpenBao), halt, verify with Merkle roots | **38/38 verified, 219 untouched**. Chaos runs (leader kill, runner kill, SIGSTOP past lease, credential revoke, `+failover`, `+late-report`, `+relay-loss`) each resume or halt with **0 double-applies and 0 stale-fence commits**. `+bleeding` blocked. No credentials left behind. `vet` catch rate on design-fault mutants reported. |
 | 9 | Books path: change package (a) and `3am-run` (b) on `gl-38` | The human-executed run is verified 38/38 by 3AM; the ledger shows the executor and key; 3AM never held a book credential |
-| 10 | Auditor: scheduled re-verification, ledger ↔ marker ↔ keel cross-check, projection rebuild diff, restore drill | A regression injected after a verified fix opens an incident; drill restored and ledgered |
+| 10 | Auditor: scheduled re-verification, ledger ↔ marker ↔ keel cross-check from raw sources, receipt inclusion checks, projection rebuild diff, restore and upgrade drills | A regression injected after a verified fix opens an incident; a withheld receipt and a split-view head are each detected; drills restored and ledgered |
 | 11 | Follow-through: Jira defect + PR (fix + regression test) on the lab `pay` repo | PR CI green, linked from the incident through the operation ID |
 | 12 | Console + CLI for the whole flow | Full demo from the console alone and from the CLI alone, keyboard only |
-| 13 | Shadow harness + trust report | Plan equivalence by clone diff; every rate with a CI; IPW estimate for one proposed autonomy rule |
+| 13 | Shadow harness + trust report + adversarial reasoner corpus | Plan equivalence by clone diff; every rate with a CI; IPW estimate for one proposed autonomy rule; `+evidence-injection` passes; 0 corpus cases reach a credential |
 
 **End-to-end target:** injection → verified in under 15 min, excluding the time humans take to approve.
 
@@ -830,8 +1098,9 @@ buckets.
   - 100% sqlguard mutation-suite block rate;
   - 0 divergences on golden replay of classic ledgers;
   - the auditor's cross-check clean.
-- **Statistics:** the `+null` false-Supported rate ≤ α (with a CI); decoys never promoted; grouped CV by scenario
-  family; vaulted truth read only by the scorer.
+- **Statistics:** the `+null` false-Supported rate ≤ α (with a CI); knockoffs never promoted and
+  `+knockoff-calibration` FDR ≤ q; stability error bound reported; grouped CV by scenario family; vaulted truth read
+  only by the scorer.
 - **Regression:** Pinata's `build/eval_loop.sh` on classic and new engines; the demo set (6, 11, 14, 97) passes
   every release ([[demo-set]]).
 - **The milestone demo:**
@@ -856,17 +1125,28 @@ buckets.
 | Script widens beyond scope (OR, missing tenant key, nondeterminism, triggers) | sqlguard AST rules, EXPLAIN, rowcount cap, declared side effects | 200+ script corpus; 100% mutation-suite block |
 | Isolation anomaly under live traffic (lost update, write skew) | Atomic set-based UPDATE; per-engine isolation; Hermitage gate | Hermitage suite per engine/version |
 | Wrong cause: confounding, Simpson, co-rollout, hidden common cause | Proof ladder; overlap gate; negative controls; sensitivity Γ*; only Proven executes | `+simpson`, `+co-rolled`, `+confounded-hidden`, `+no-overlap` |
-| False discovery from searching hundreds of attributes | Permutation FDR; decoys; sample splitting; pre-registered analysis record | `+null` over many seeds; decoy promotion = 0 |
+| False discovery from searching hundreds of attributes | Model-X knockoff+ selection; permutation null; sample splitting; stability selection with stated bound; pre-registered analysis record | `+null` and `+knockoff-calibration` over many seeds; knockoff promotion = 0 |
+| Decoy check passes while correlated nulls slip through | Knockoffs preserve cross-correlation; never permuted copies | `+knockoff-calibration` |
+| ICP names a non-cause (selection, repaired shards, outcome-defined environments) | Exogenous environments only; informative Unknowns cap rung 3; pairwise environments | `+unknown-informative`, `+repaired-env` |
+| CDC silently misses or resurrects a row | CDC contract per engine; snapshot comparison on Postgres; SNAPSHOT on SQL Server; fail closed on discontinuous history | `+pg-resurrect`, `+sqlserver-skip`; CdcMerge spec |
+| Stale report from a superseded epoch flips state | Epoch on every report; quarantine (invariant 15) | `+late-report`; madsim superseded-epoch case |
+| keel command applied twice by an etcd client retry | Op ID inside the same etcd transaction | madsim lost-ack on keel commands |
+| Lease renewal starved by TCP back-off on the relay | Separate prioritised keepalive with its own deadline; jeopardy | `+relay-loss`; chaos under packet loss |
+| Correlated design fault in keel and runner | `vet` diverse pre-apply check with a separate owner and raw inputs (invariant 17) | Design-fault mutant catch rate |
 | Conditioning on post-change variables | Covariate rules refuse post-treatment adjustment sets | `+post-treatment-trap` |
-| LLM hallucinated value or plan | Reasoner can't grant rungs; values verbatim from evidence; System 1 veto; sqlguard | Golden replay; adversarial prompt corpus |
+| LLM hallucinated value or plan | Reasoner can't grant rungs; values verbatim from evidence, checked mechanically; ambiguity fails; System 1 veto; sqlguard | Golden replay; adversarial reasoner corpus |
+| Evidence contains instructions to the reasoner (indirect prompt injection) | Invariant 16; no egress; no memory; templated tools; hidden-text stripping; deterministic evidence first in the approval view | `+evidence-injection`; corpus with injections through evidence channels |
 | Fix treats symptom, not cause | "Mitigation, not repair" label; verify cause probe | Lab symptom-only plans can't close |
 | Canary "looked fine" by chance | Randomised canary + FRT health gate with known false-pass rate | Lab regression injected into a later wave |
 | Rubber-stamp approval | Two distinct humans, WebAuthn, view-hash, expiry, Cedar | Refusal tests; ledger audit |
 | Insider rewrites history | Transparency log with customer witness co-sign; inclusion/consistency proofs | Auditor cross-check; external verification tool |
+| 3AM shows different histories to different parties (split view) | Head gossip with consistency proofs; witness stores heads and refuses inconsistent ones | Lab split-view injection |
+| keel accepts a record but never ledgers it | Receipts with an MMD; inclusion proof demanded per receipt; a fresh head every MMD | Lab withheld-receipt injection |
+| "Deleted" data survives on SSD, snapshot or swap | Crypto-shredding everywhere plaintext can land; ledgered key destruction | Retention drill; runner disk and swap scan |
 | Compromised site forges evidence | Per-site signing keys; range-checked summaries; no BFT claim (books stay human) | Pen test |
 | AI writes to books | No book credential exists; sqlguard refusal; `3am-run` runs under human key only | `gl-38`; credential inventory audit |
 | PII leak via evidence or prompts | Summaries only; per-incident keys; crypto-shredding; no PII to external models | DLP scan in CI; retention drill |
-| Clock skew fakes "change preceded onset" | Clock-uncertainty intervals; NTP gate ±250 ms; three timestamps | Skew injection in madsim |
+| Clock skew fakes "change preceded onset" | Clock-uncertainty intervals with measured ε; `C.latest < O.earliest`; NTP gate ±250 ms; three timestamps; LSN order within a shard | Skew injection in madsim; `+leap-smear` |
 | Schema/version mismatch during upgrade | `critical` fields rejected by old readers; servers first; buf breaking | Mixed-version lab runs |
 | Coordinator down mid-wave | etcd quorum; halt-safe; leases lapse; reconcile from markers | Chaos leader kill |
 | Fix later undone by a new release | Auditor scheduled re-verification opens incident | Post-fix regression injection |
@@ -880,7 +1160,18 @@ buckets.
 - **The SUTVA assumption inside a clone** (Design A) is assumed and checked indirectly, not proven.
 - **Lab validity is internal only.** Every customer estate needs its own shadow trust record before any write.
 - **Correlated software faults.** The same code runs in every site, so a keel/runner bug could be fleet-wide.
-  Mitigated by N-version Auditor, deterministic simulation, staged rollout of 3AM itself, and the books boundary.
+  - **Tolerated at execution time** by `vet`, the diverse pre-apply checker.
+  - **Detected after the fact** by `auditor`.
+  - Reduced by deterministic simulation, staged rollout of 3AM itself, and the books boundary.
+  - Design diversity is not independence. Shared specs, shared people and shared libraries cause related faults,
+    and independently written versions have been measured failing together far more often than independence
+    predicts (Avizienis 1985; Knight & Leveson 1986). So `vet`'s protection is measured with design-fault mutants,
+    never computed by multiplying failure probabilities.
+  - `vet` and keel must run the same spec version, and a deploy with mismatched versions is refused.
+- **Exchangeability is assumed** by conformal calibration and stability selection. Payroll seasonality and deploys
+  break it. Mondrian splits and recalibration reduce the damage but don't remove it.
+- **Prompt injection has no complete defence.** The plan's answer is structural: the reasoner holds no authority and
+  no egress. A manipulated proposal can still waste human time.
 - **Customer-side changes we can't see** (manual DBA hotfixes outside 3AM) show as drift or unknown, never as
   clean; they can still delay incidents.
 - **Human approvers can still approve a wrong-but-proven plan** if the proof's estimand doesn't match the
@@ -893,26 +1184,33 @@ buckets.
 3. Hermitage green for the customer's exact engine/version.
 4. sqlguard 100% mutation block; external review of the rule set.
 5. Fleetlab: all variants pass with stated CIs; `+null` false-Supported ≤ α.
-6. Independent security review + pen test of keel, runner, relay, broker; ledger verifiable by a customer-run tool.
+6. Independent security review + pen test of keel, runner, `vet`, relay, broker; ledger verifiable by a customer-run
+   tool (RFC 6962-compatible); witness refusal and head gossip demonstrated.
 7. Customer estate shadow record meets graduation (30 consecutive, 0 unsafe, upper 95% bound ≤10%, ≥95%
    equivalence).
 8. Customer DBA sign-off on marker/fence tables, isolation settings, payroll windows; CAB integration if required.
-9. Restore drill of ledger and evidence store passed and ledgered.
+9. Restore and upgrade drills of ledger and evidence store passed and ledgered.
+10. CDC contract tests green for the customer's exact engine/version (`+pg-resurrect`, `+sqlserver-skip`).
+11. `vet` design-fault mutant catch rate reported and accepted; adversarial reasoner corpus with 0 cases reaching a
+    credential.
 
 ## Open questions (need the founder before step 3)
 
 1. UKG's engine(s) and versions, and the tenancy model (database, schema or `tenant_id` per tenant).
 2. The source of truth for tenant → shard routing, and whether it is versioned.
-3. Will DBAs accept `_threeam.applied` and `_threeam.fence` in each shard? They are the exactly-once and fencing
-   anchors.
-4. Where may encrypted before-images (payroll PII) live, and for how long?
+3. Will DBAs accept `_threeam.applied`, `_threeam.fence` and the CDC watermark table in each shard? They are the
+   exactly-once, fencing and CDC-correctness anchors. Without the watermark table, CDC falls back to read-only
+   variants where the engine has one.
+4. Where may encrypted before-images (payroll PII) live, and for how long? The proposed answer: encrypted at source
+   and deleted by ledgered key destruction, so location matters less.
 5. May rehearsal and **clone experiments** use production clones, or only replicas/staging? Rung 5 depends on this.
 6. Are UKG's flag and release rollouts **randomised** (hash-bucketed)? If so, natural experiments come for free.
 7. Are their book tables ledger-style (compensating entries) or mutable balances?
 8. Approver identity: Okta or Entra? Hardware keys? Is a ServiceNow CAB step required?
 9. On-prem secrets: CyberArk, Vault, or nothing?
 10. Must on-prem sites keep reading if the control plane is down? (Planned: yes, read-only.)
-11. Which LLMs are allowed inside the boundary: self-hosted, Vertex or Bedrock?
+11. Which LLMs are allowed inside the boundary: self-hosted, Vertex or Bedrock? Decide this on PII and residency
+    grounds. Injection risk is the same for all of them, and the structural controls handle it.
 12. The monthly lab budget (GCP + AWS), including clone-experiment cost.
 
 ## Housekeeping after approval
@@ -982,7 +1280,7 @@ buckets.
 | 8 | Bootstrap includes adaptive steps; bootstrap ≈ posterior; bagging; stacking; BIC posteriors; EM | Stability bootstrap; detector stacking; hypothesis posteriors |
 | 9 | GAMs; trees and PRIM as interpretable rules; high-cardinality overfit; loss-weighted trees; ROC; MAR/MCAR | Describe (rule); invariant 10 and `+unknown-informative` |
 | 10, 15 | Robust (Huber) loss; hurdle models for counts; importance and partial dependence are not causal; OOB ≈ CV | Detect baselines; bad-row counts; honesty rule on interpretation |
-| 11 | Artificial probe features expose spurious selection | Decoys in every differential |
+| 11 | Artificial probe features expose spurious selection | Knockoffs in every differential (built as model-X knockoffs, not permutations; see the paper index) |
 | 12, 13 | Hinge loss doesn't give probabilities; several prototypes per class; invariant metrics | Calibrated probabilities only; mixture signatures; incident similarity |
 | 14 | Unsupervised has no ground truth; gap statistic / permuted null; unsupervised-as-supervised drift; product-of-marginals reference; ICA | Clustering as navigation; missing-topology null; drift classifier; rare associations |
 | 16 | Bet on sparsity; rule ensembles | Estimator choice; Describe |
@@ -1004,3 +1302,37 @@ buckets.
 | 21–25 | Encouragement/noncompliance, CACE, weak IV, FAR intervals, IV inequalities, fuzzy RD, Egger regression | Rollout analysis (ITT/CACE); falsification; multiple instruments |
 | 26–28 | Principal stratification; never condition on post-treatment variables; natural effects are cross-world; controlled direct effect | Covariate rules; mechanism via cde in clones |
 | 29 | Time-varying confounding; g-formula, MSM, sequential IPW; g-null paradox | Autonomy/remediation policy evaluation |
+
+## Paper index: paper → what it changed
+
+Full reading notes are in `papers/NOTES.md`. The folder is gitignored because the PDFs are copyrighted.
+
+| Paper | Changed | Lives in |
+|---|---|---|
+| Crosby & Wallach 2009, tamper-evident logging | Tamper evidence needs audits and gossip; Merkle aggregation for provably complete queries; batched signing | Ledger |
+| Gutmann 1996, secure deletion | Overwrite isn't deletion on SSDs or clouds; crypto-shred everywhere plaintext lands; ledger key destruction | Data is hazardous; open question 4 |
+| Zhou et al. 2021, FoundationDB | Buggify, swarm testing, coverage counters; store modelled by contract; one tested error path; short chunked transactions | Reliability; sqlguard; step 2 |
+| Ongaro & Ousterhout 2014, Raft | Idempotent keel commands by op ID; linearizable authority reads; CAS on the leader revision; learners and joint consensus | Invariant 12; keel; HA |
+| Helland 2015, immutability | Compensating entries; version IDs never mutable names; clones as immutable DataSets | Books; Approve; Rehearse |
+| Barber & Candès 2015, knockoffs | **Permuted decoys fail FDR (45.6% at a nominal 20%)**; knockoff+; BH not guaranteed under correlation | Honesty rules; `+knockoff-calibration` |
+| Shafer & Vovk 2008, conformal prediction | Distribution-free alert rates; Mondrian calibration; credibility as the reject option; exchangeability caveat | Detect; residual risks |
+| Corbett et al. 2012, Spanner | Precedence = `C.latest < O.earliest`; measured ε; leap-smear mismatch; LSN order; lease length from halt latency | IDs and time; `+leap-smear` |
+| Burrows 2006, Chubby | Fence = sequencer; lock-delay for unfenceable targets; jeopardy; epochs; suffix-only loss; keepalives vs TCP back-off | Invariant 6; runner; relay; Execute |
+| Fischer, Lynch & Paterson 1985, FLP | Basis of TimeoutIsUnknown; no safety property on timeouts; liveness under partial synchrony | Invariant 9; liveness |
+| Lamport et al. 2002, TLA+ | Invariants in TLA+ first; inductive invariant for large-instance bugs; traces both ways; contract modules | TLA+ |
+| Deligiannis et al. 2016, P# | Hot/cold liveness monitors; PCT scheduler; reference-model oracle; stale reports from dead nodes | Invariant 15; madsim; `+late-report` |
+| RFC 6962, Certificate Transparency | Exact tree construction; receipts with an MMD; a fresh head every MMD; key-version history | Ledger; gate 6 |
+| Chuat et al. 2015, CT gossip | Head + consistency-proof gossip in existing RPCs; witness refuses inconsistent heads; warning vs proof | Ledger; console |
+| Candès et al. 2018, model-X knockoffs | Knockoffs from the attribute distribution; CRT = FRT for randomised attributes; no logistic p-values at p/n ≳ 0.1; group knockoffs; i.i.d. caveat | Honesty rules |
+| Peters, Bühlmann & Meinshausen 2016, ICP | **Rung 3 = "contained in the parents"**; exogenous environments; informative Unknowns cap; pairwise environments | Rung 3; ICP rules; `+repaired-env` |
+| Meinshausen & Bühlmann 2010, stability selection | Error bound; complementary pairs; group and block resampling | Honesty rules |
+| Andreakis & Papapanagiotou 2020, DBLog | No locking snapshots; non-stale reads vs replicas; watermark table is a write | CDC contract; open question 3 |
+| Andreakis 2026, Generalized DBLog (preprint, machine-checked) | **Postgres resurrected-delete fix**; SQL Server snapshot reads; `updated_at` is outside the contract; coordinate-bound probes; fail closed | CDC contract; Scope; rung 4; `+pg-resurrect` |
+| Kreps et al. 2011, Kafka | At-least-once, so idempotent consumers; per-partition order; retention alarms; count audits; schema IDs | Bus contract |
+| Saltzer & Schroeder 1975, protection | Revocation latency = TTL; prescripts; complete mediation; confinement of the reasoner; no shared approver accounts | JIT; Approve; invariants 14, 16 |
+| Ruan et al. 2024, ToolEmu | Prompting isn't a control (23.9% failures); mechanical verbatim and ambiguity checks; LLM judges advisory; adversarial corpus | LLM boundary; reasoner corpus |
+| Greshake et al. 2023, indirect prompt injection | Evidence is attacker-controlled; no egress; no memory; hidden-text stripping; evidence above prose | LLM boundary; invariant 16; `+evidence-injection` |
+| Avizienis 1985, N-version software | **The auditor detects, it doesn't tolerate**; `vet` in the commit path; spec as the common cause; measure diversity | Invariant 17; `vet`; residual risks |
+
+Outside the reviewed set, cited once: Knight & Leveson 1986 (an experiment showing correlated failures across
+independently written versions), Shah & Samworth 2013 (complementary-pairs stability selection).
