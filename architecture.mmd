@@ -22,15 +22,15 @@ flowchart TB
         subgraph Sync_Zone [Narrow Linearizable Write Path]
             Keel[keel: Rust - safety kernel]
             Etcd[(etcd: quorum, leases, fences)]
-            Ledger[(Transparency log - KMS seal + customer witness)]
+            Ledger[(Transparency log - RFC 6962 tree, KMS seal, customer witness, head gossip)]
         end
 
         subgraph Async_Zone [Broad Asynchronous Read & Planning Surface]
             Bus((NATS JetStream: streams & work queues))
             Infer[infer: Python - stats & causal, no LLM]
-            Reasoner[reasoner: Python - LLM proposals only]
+            Reasoner[reasoner: Python - LLM proposals only, no egress, no authority]
             Cloud[cloud: Go - read adapters & change ingest]
-            Auditor[auditor: Go - independent verifier]
+            Auditor[auditor: Go - detects after the fact]
             Proj[(Postgres projections - derived)]
         end
     end
@@ -46,6 +46,7 @@ flowchart TB
         subgraph Site_1 [Site 1]
             Relay1[relay: NATS leaf, outbound 443]
             Runner1[runner: Rust agent]
+            Vet1[vet: Go - diverse pre-apply check]
             subgraph Shards_1 [Customer shards - primary + replica]
                 Ops1[(Operational tables)]
                 Books1[(Book tables - read-only to 3AM)]
@@ -95,7 +96,11 @@ flowchart TB
     RelayN --- RunnerN
     Runner1 -- "Read probes: summaries + observed position" --> Ops1
     Runner1 -- "Read probes & post-DBA verification" --> Books1
+    Runner1 -- "Proposed step: plan, fence, scope, after-image" --> Vet1
+    Vet1 -- "Signed step token, required for JIT credential" --> Runner1
+    Vet1 -. "Own linearizable read: approvals, fence" .-> Etcd
     Runner1 == "JIT credential, fence, premise re-check, marker, commit" ==> Ops1
+    Vet1 -- "Read-back: marker, checksum" --> Ops1
     Runner1 -- "Clone: do(cause) / placebo" --> Clone1
     Runner1 -- "Pre-signed upload: evidence, encrypted before-images" --> Evidence
     RunnerN --> ShardsN
@@ -116,7 +121,7 @@ flowchart TB
     classDef ext fill:#f5f5f5,stroke:#757575;
 
     class Async_Zone async;
-    class Sync_Zone,Keel,Etcd,Ledger sync;
+    class Sync_Zone,Keel,Etcd,Ledger,Vet1 sync;
     class Approvers,DBA human;
     class Books1 books;
     class CloudAPIs,Changes,Followups,CAB ext;
